@@ -1,0 +1,33 @@
+model:
+  name: "Qwen/Qwen2.5-7B-Instruct"
+  save_path: "./checkpoints/first_mcq_lora_realval-1"
+
+data:
+  train_csv: "./data/train.csv"
+  test_csv: "./data/test.csv"
+  submission_csv: "./checkpoints/submission.csv"
+  val_frac: 0.1
+  max_length: 1024
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+
+training:
+  num_epochs: 2
+  batch_size: 1        # bump to 2 if you have headroom, drop if OOM
+  grad_accum: 8         # effective batch = batch_size * grad_accum
+  lr: 2e-4
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  top1_weight: 2.0       # weight on correct-vs-wrong pairs in ranking loss
+  full_train: false        # if true, trains on all rows, val is a small dummy sample
+  shuffle_options: true    # shuffle A-E mapping during training to avoid positional bias
+
+wandb:
+  use_wandb: true
+  project: "smart-mcq-solver-2"
+  run_name: "qwen2.5-7b-first-5epoch-2k"
+
+seed: 42
