@@ -107,22 +107,29 @@ evaluation in this repo is done on a held-out split carved out of
 
 ```
 my_finetune_project/
-├── config.yaml              # all hyperparameters, paths, wandb settings
-├── requirements.txt         # pip dependencies
-├── train.py                 # training entrypoint (loads config, trains, saves best checkpoint)
-├── test.py                  # inference-only: loads a checkpoint, predicts on test.csv
-├── eval.py                  # evaluates a fine-tuned checkpoint on a held-out split of train.csv
-├── eval_base_only.py        # evaluates the RAW base model (no LoRA) for baseline comparison
-├── data/                    # train.csv / test.csv (not committed — see .gitignore note below)
-└── checkpoints/             # saved LoRA adapter weights (large — see Hugging Face section)
+├── .gitignore                # excludes data/ and checkpoints/ from the repo
+├── README.md
+├── config.yaml                # all hyperparameters, paths, wandb settings
+├── requirement.txt            # pip dependencies
+├── train.py                   # training entrypoint (loads config, trains, saves best checkpoint)
+├── test.py                    # inference-only: loads a checkpoint, predicts on test.csv
+├── eval.py                    # evaluates a fine-tuned checkpoint on a held-out split of train.csv
+├── eval_base_only.py          # evaluates the RAW base model (no LoRA) for baseline comparison
+├── data/                       # train.csv / test.csv — gitignored, not in the repo
+└── checkpoints/                # saved LoRA adapter weights — gitignored (see Hugging Face section)
 ```
+
+> `data/` and `checkpoints/` are intentionally excluded from version control
+> via `.gitignore` — the dataset is redistributable separately and the
+> checkpoint is published on Hugging Face instead (see below) rather than
+> committed to git.
 
 ## Setup
 
 ```bash
 conda create -n finetune python=3.10 -y
 conda activate finetune
-pip install -r requirements.txt
+pip install -r requirement.txt
 ```
 
 Unzip the dataset into `data/` so `data/train.csv` and `data/test.csv` exist,
@@ -166,11 +173,27 @@ excludes the rows it was evaluated on.
 
 ### Results
 
+**Kaggle private leaderboard (MAP@3) — the authoritative, held-out score:**
+
+| Model | MAP@3 (private LB) |
+|---|---|
+| Base model (no LoRA) | 0.65 |
+| Fine-tuned (LoRA) | **0.78** |
+
+Fine-tuning improved MAP@3 by **+0.13** on data the model never saw during
+training or development — this is the trustworthy, final result.
+
+**Local held-out evaluation (sample from `train.csv`, for quick iteration):**
+
 | Model | MAP@3 | Accuracy | F1 (macro) | Notes |
 |---|---|---|---|---|
-| Base model (no LoRA) | 0.8517 | 0.7433 | 0.7371 | Zero-shot, 300-row sample, trustworthy |
-| Fine-tuned (full_train=True) | 1.0000 | 1.0000 | 1.0000 | **Not trustworthy** — model memorized this data during training |
-| Fine-tuned (proper val split) | _pending_ | _pending_ | _pending_ | To be filled in once a `full_train=False` run completes |
+| Base model (no LoRA) | 0.8517 | 0.7433 | 0.7371 | Zero-shot, 300-row sample |
+| Fine-tuned (full_train=True) | 1.0000 | 1.0000 | 1.0000 | Not meaningful — model memorized this data during training; kept here only to illustrate why `eval.py`/`eval_base_only.py` need a genuinely held-out split to be trusted |
+
+The local eval scripts (`eval.py`, `eval_base_only.py`) are useful for fast
+iteration without needing a Kaggle submission, but the Kaggle private
+leaderboard numbers above are the real measure of generalization, since that
+test set was never touched during training or local validation.
 
 ## Uploading to Hugging Face
 
