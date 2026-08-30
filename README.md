@@ -1,130 +1,186 @@
-# Smart MCQ Solver — Qwen2.5-7B-Instruct + LoRA
+# Smart MCQ Solver
 
-Fine-tuning `Qwen/Qwen2.5-7B-Instruct` with QLoRA to answer 5-option (A–E)
-multiple-choice questions, trained on the Smart MCQ Solver Challenge dataset
-and optimized with a custom ranking loss for the competition's MAP@3 metric.
+Fine-tuning `Qwen2.5-7B-Instruct` to answer 5-option (A-E) multiple-choice
+questions, trained with QLoRA and a custom ranking loss aimed directly at
+the competition's actual metric (MAP@3), instead of plain next-token
+cross-entropy.
 
-## Overview
+**[Try it live](https://huggingface.co/spaces/Adarshraj31415/smart-mcq-solver-demo)**
+**[LoRA adapter on the Hub](https://huggingface.co/Adarshraj31415/smart-mcq-qwen2.5-lora)**
 
-- **Base model:** [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct)
-- **Fine-tuning method:** QLoRA (4-bit NF4 quantization + LoRA adapters)
-- **Task:** Given a question and 5 options (A–E), predict the top-3 most
-  likely correct answers, ranked by confidence
-- **Target metric:** MAP@3 (Mean Average Precision @ 3)
-- **Trainable parameters:** ~40.4M out of ~7.66B total (0.53%)
+**TL;DR:** base model scores 0.65 MAP@3 on the Kaggle private leaderboard.
+Fine-tuned model scores **0.78**. That's a 0.13 improvement from about 40M
+trainable parameters (0.53% of the model) and one epoch over 1,800 examples.
 
-## Model architecture
+---
 
-The base model is loaded in 4-bit (NF4, double quantization, bfloat16 compute
-dtype) via `bitsandbytes`, with LoRA adapters attached to all major linear
-projections:
+## Why this exists
 
-```
-target_modules: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
-r = 16
-lora_alpha = 32
-lora_dropout = 0.05
-```
+The task: given a question and 5 labeled options, return your top-3 guesses
+ranked by confidence, scored by MAP@3 (full credit if the right answer is
+your #1 guess, half credit if it's #2, a third credit if it's #3, zero
+otherwise). This is a Kaggle competition format (Smart MCQ Solver
+Challenge). Submissions are now closed, so the private leaderboard score
+quoted above is the last real signal I got from Kaggle before it locked.
 
-Each option letter (A–E) is verified to tokenize to a single token, and the
-model's next-token logits over just those 5 token IDs are used directly as
-the option scores — no separate classification head is added.
+Everything past that point, local evaluation scripts, the retraining runs,
+the multi-GPU debugging, happened after the leaderboard was already frozen.
+That's worth keeping in mind when you read the results section: the
+0.65 to 0.78 number is real and trustworthy. Numbers from my own local eval
+script need an asterisk, explained below.
 
-## Training methodology
+## How it works
 
-### Prompt format
+**Base model:** `Qwen/Qwen2.5-7B-Instruct`, loaded in 4-bit NF4
+(double-quantized, bfloat16 compute dtype) via `bitsandbytes`.
 
-Questions are formatted as a chat-style prompt (Qwen ChatML) asking the model
-to respond with a single letter:
+**Adapter:** LoRA, r=16, alpha=32, dropout=0.05, attached to every linear
+projection in the transformer block (`q/k/v/o_proj` and
+`gate/up/down_proj`), not just attention. About 40.4M trainable params out
+of about 7.66B total.
 
-```
-<|im_start|>system
-You are an expert at answering multiple choice questions...
-<|im_start|>user
-{question}
+**Scoring trick:** rather than generating text and parsing it, I read the
+model's next-token logits at the single position right after the prompt,
+restricted to just the 5 token IDs for "A" through "E" (each verified to be
+a single token, see the sanity check in `train.py`). Softmax over those 5
+logits gives a probability distribution over options directly, no
+generation or parsing needed. This is both faster and removes an entire
+class of "model said the right thing but I parsed it wrong" bugs.
 
-Options:
-A: ...
-B: ...
-...
-<|im_start|>assistant
-```
-
-### Custom loss — Weighted RankNet ("FIRST" loss)
-
-Instead of standard cross-entropy over the 5 option logits, training uses a
-pairwise ranking loss (RankNet-style) that explicitly pushes the correct
-option's score above every incorrect option's score:
+**Loss: weighted RankNet, not cross-entropy.**
 
 ```
-loss = top1_weight * mean(softplus(-(score_correct - score_wrong)))
+loss = top1_weight * mean( softplus(-(score_correct - score_wrong)) )
+       over all wrong options, per example
 ```
 
-This aligns the training objective more directly with the MAP@3 ranking
-metric than plain classification would. `top1_weight` (default `2.0`)
-controls how strongly the correct-vs-wrong margin is emphasized.
+Cross-entropy optimizes for the correct answer having the single highest
+probability. MAP@3 only cares that the correct answer is somewhere in the
+top 3. A pairwise ranking loss, pushing the correct option's score above
+every wrong option's score individually, is a closer match to what's
+actually being scored. `top1_weight=2.0` upweights getting rank 1 right
+specifically, since that's worth more points than rank 2 or 3.
 
-### Anti-bias augmentation
+**Anti-bias augmentation:** the raw label distribution is skewed (B: 490,
+C: 459, A: 369, D: 358, E: 324 out of 2000). Left alone, a model can partially
+game this by learning "B and C are more likely" instead of reading the
+question. The fix: during training only, randomly permute which letter maps
+to which option text on every example, and remap the correct index to
+match. The model never gets to memorize a positional prior, it has to read.
+This is disabled at eval and inference time.
 
-The training dataset has an uneven natural distribution of correct answers
-(B and C are over-represented). To prevent the model from learning a
-positional/letter bias instead of the actual content, `shuffle_options=True`
-randomly permutes which letter maps to which option text on every training
-example, with `correct_idx` remapped accordingly. This augmentation is
-**disabled** for validation/test.
+## The multi-GPU saga (why "just add more GPUs" isn't free)
 
-### Hyperparameters
+This section exists because I hit the same wall twice and want the next
+person (possibly future me) to skip both trips.
 
-| Setting | Value |
-|---|---|
-| Batch size | 1 |
-| Gradient accumulation | 8 (effective batch = 8) |
-| Learning rate | 2e-4 |
-| LR schedule | Cosine with warmup (10%) |
-| Max sequence length | 1024 |
-| Max grad norm | 1.0 |
-| Optimizer | AdamW (β=0.9, 0.999, wd=0.01) |
+**Attempt 1:** `python train.py` on a single GPU, a 2080 Ti with 10.75 GiB
+VRAM. Trained fine for 10 steps, then:
 
-All hyperparameters live in `config.yaml` and are not hardcoded in the
-scripts.
+```
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 130.00 MiB.
+GPU 6 has a total capacity of 10.75 GiB of which 23.62 MiB is free.
+```
 
-## Dataset
+The tell here isn't that it failed immediately (that would mean the model
+just doesn't fit), it's that it failed at step 10. That pattern points at
+allocator fragmentation, not a hard capacity wall: activation memory for a
+7B model's backward pass, combined with bitsandbytes dequantizing 4-bit
+weights on the fly per layer, adds up fast with no gradient checkpointing
+enabled.
 
-- **Source:** Smart MCQ Solver Challenge (originally a Kaggle competition;
-  submissions are now closed)
-- **Train set:** 2,000 labeled rows (`id, prompt, A, B, C, D, E, answer`)
-- **Test set:** 500 unlabeled rows (`id, prompt, A, B, C, D, E`) — since
-  Kaggle submissions are closed, this split can no longer be scored and is
-  used only for generating predictions, not evaluation
-- Answer distribution is imbalanced (B: 490, C: 459, A: 369, D: 358, E: 324),
-  which motivated the option-shuffling augmentation above
+**Attempt 2:** switched to multi-GPU with `accelerate`:
 
-Since there is no way to score the official test set anymore, **all
-evaluation in this repo is done on a held-out split carved out of
-`train.csv`** (see Evaluation below).
+```bash
+accelerate launch --multi_gpu --num_processes=7 --mixed_precision=bf16 train.py
+```
+
+This part is worth being explicit about, because it's a common
+misconception: multi-GPU does not reduce each GPU's own memory load. Each
+of the 7 processes still runs its own independent `batch_size=1`
+forward/backward pass on its own GPU. You get 7x throughput (7 examples
+processed in parallel instead of 1), not more headroom per GPU. So this run
+OOM'd too, same failure, now visible on rank 4 in the DDP logs instead of a
+single process.
+
+**The actual fix: gradient checkpointing.**
+
+```python
+model.gradient_checkpointing_enable()
+model.enable_input_require_grads()  # required for PEFT + grad checkpointing together
+```
+
+This trades compute for memory: instead of storing every layer's
+activations for the backward pass, it recomputes them on the fly. Slower
+per step, dramatically lower peak memory. Combined with multi-GPU for
+throughput, this is what finally got a clean run: 258 steps in 15 minutes
+23 seconds across 7 GPUs, no OOM.
+
+Lesson, stated plainly: multi-GPU solves utilization, gradient checkpointing
+solves memory. They are not substitutes for each other. If you only have
+room in your head for one fix, figure out which problem you actually have
+before reaching for either.
+
+## Known limitation: don't trust my local eval numbers yet
+
+After the multi-GPU run above finished, `eval.py --val_frac 0.15` reported
+99.5% MAP@3 and 99.33% accuracy on a 300-example sample. That number should
+raise your eyebrows. It raised mine. 99%+ on held-out MCQ data after a
+single epoch is not a realistic generalization result.
+
+The likely cause: `train.py` holds out its validation split with
+`train_df.sample(frac=0.1, random_state=42)` (200 of 2000 rows), training on
+the remaining 1800. But `eval.py`, when run separately, does an independent
+`train_df.sample(frac=0.15, random_state=42)` against the same full
+2000-row `train.csv`, not a file guaranteed disjoint from what training
+actually saw. With only 200 rows ever excluded from training, a fresh
+random 300-row sample will, by simple probability, contain mostly rows the
+model already trained on. That's not measuring generalization, it's mostly
+re-scoring the training set.
+
+This is a real bug in `eval.py`, not yet fixed as of this README. The
+Kaggle private leaderboard score (0.78, quoted above) is unaffected by
+this, that test set was genuinely never touched by training, at any point.
+But any number from `eval.py` or `eval_base_only.py` should be treated as
+provisional until the split logic is fixed to persist and reuse the exact
+row indices `train.py` excluded, rather than re-sampling independently.
+
+If you're picking this project up: the fix is to save the held-out index
+list (for example `val_indices.json`) at the end of `train.py`'s split
+step, and have `eval.py` load and reuse those exact indices instead of
+calling `.sample()` again with just a matching seed. A matching seed on a
+different sample size (0.1 vs 0.15) does not guarantee the same rows get
+excluded. That's the actual bug.
+
+## Results
+
+| Model | MAP@3 | Source | Trustworthy |
+|---|---|---|---|
+| Base model (no LoRA) | 0.65 | Kaggle private leaderboard | Yes |
+| Fine-tuned (LoRA) | 0.78 | Kaggle private leaderboard | Yes |
+| Base model (no LoRA) | 0.8517 | Local eval, 300-row sample | Yes (base model never trained on anything) |
+| Fine-tuned (LoRA) | 0.995 | Local eval, 300-row sample | No, see limitation above, likely leakage |
+
+The number that matters is the 0.13 improvement on Kaggle's private test
+set. Everything else here is a debugging trail, kept visible on purpose.
 
 ## Repository structure
 
 ```
 my_finetune_project/
-├── .gitignore                # excludes data/ and checkpoints/ from the repo
+├── .gitignore              # excludes data/ and checkpoints/
 ├── README.md
-├── config.yaml                # all hyperparameters, paths, wandb settings
-├── requirement.txt            # pip dependencies
-├── train.py                   # training entrypoint (loads config, trains, saves best checkpoint)
-├── test.py                    # inference-only: loads a checkpoint, predicts on test.csv
-├── eval.py                    # evaluates a fine-tuned checkpoint on a held-out split of train.csv
-├── eval_base_only.py          # evaluates the RAW base model (no LoRA) for baseline comparison
-├── data/                       # train.csv / test.csv — gitignored, not in the repo
-└── checkpoints/                # saved LoRA adapter weights — gitignored (see Hugging Face section)
+├── config.yaml              # all hyperparameters, paths, wandb settings
+├── requirement.txt          # pip dependencies
+├── train.py                 # training entrypoint, supports single and multi-GPU via accelerate
+├── test.py                  # inference-only: loads a checkpoint, predicts on test.csv
+├── eval.py                  # evaluates a fine-tuned checkpoint on a sampled split of train.csv (see limitation above)
+├── eval_base_only.py        # evaluates the raw base model (no LoRA) for baseline comparison
+├── data/                     # train.csv / test.csv, gitignored
+└── checkpoints/              # saved LoRA adapter weights, gitignored, published to HF Hub instead
 ```
 
-> `data/` and `checkpoints/` are intentionally excluded from version control
-> via `.gitignore` — the dataset is redistributable separately and the
-> checkpoint is published on Hugging Face instead (see below) rather than
-> committed to git.
-
-## Setup
+## Running it yourself
 
 ```bash
 conda create -n finetune python=3.10 -y
@@ -132,103 +188,43 @@ conda activate finetune
 pip install -r requirement.txt
 ```
 
-Unzip the dataset into `data/` so `data/train.csv` and `data/test.csv` exist,
-matching the paths in `config.yaml`.
-
-## Training
-
+Single GPU:
 ```bash
 python train.py
 ```
 
-- If `full_train: true` in `config.yaml`, the model trains on all rows of
-  `train.csv` (no held-out validation — used for producing a final
-  deployment checkpoint, not for measuring generalization).
-- If `full_train: false`, a real `val_frac` split (default 10%) is held out
-  and never trained on; `Val MAP@3` is printed after every epoch and is a
-  trustworthy generalization estimate.
-- The best checkpoint (by validation MAP@3) is saved to `save_path`.
-- Training logs (batch loss, LR, epoch metrics) are sent to Weights & Biases
-  if `use_wandb: true`.
-
-## Evaluation
-
-Because the official test set can no longer be scored, evaluation is done
-against a held-out sample of `train.csv`'s labeled rows.
-
+Multi-GPU (recommended if you have more than one card, see the saga above
+for why gradient checkpointing matters either way):
 ```bash
-# Evaluate the fine-tuned checkpoint
-python eval.py --val_frac 0.15
-
-# Evaluate the raw base model (no LoRA) for comparison
-python eval_base_only.py --val_frac 0.15
+accelerate launch --multi_gpu --num_processes=<N> --mixed_precision=bf16 train.py
 ```
 
-**Important caveat:** if a checkpoint was trained with `full_train: true`,
-it has already seen every row in `train.csv`, including whatever rows get
-sampled into the "held-out" eval split — so `eval.py` on such a checkpoint
-measures memorization, not generalization. For an honest score, evaluate a
-checkpoint that was trained with `full_train: false` on a split that
-excludes the rows it was evaluated on.
+## Live demo
 
-### Results
+The [Space](https://huggingface.co/spaces/Adarshraj31415/smart-mcq-solver-demo)
+runs on Hugging Face ZeroGPU, free shared GPU access, attached only for the
+duration of each request via the `@spaces.GPU` decorator. The first request
+after the Space goes idle will be slower (model loads fresh and gets
+cached); subsequent requests reuse the loaded model.
 
-**Kaggle private leaderboard (MAP@3) — the authoritative, held-out score:**
-
-| Model | MAP@3 (private LB) |
-|---|---|
-| Base model (no LoRA) | 0.65 |
-| Fine-tuned (LoRA) | **0.78** |
-
-Fine-tuning improved MAP@3 by **+0.13** on data the model never saw during
-training or development — this is the trustworthy, final result.
-
-**Local held-out evaluation (sample from `train.csv`, for quick iteration):**
-
-| Model | MAP@3 | Accuracy | F1 (macro) | Notes |
-|---|---|---|---|---|
-| Base model (no LoRA) | 0.8517 | 0.7433 | 0.7371 | Zero-shot, 300-row sample |
-| Fine-tuned (full_train=True) | 1.0000 | 1.0000 | 1.0000 | Not meaningful — model memorized this data during training; kept here only to illustrate why `eval.py`/`eval_base_only.py` need a genuinely held-out split to be trusted |
-
-The local eval scripts (`eval.py`, `eval_base_only.py`) are useful for fast
-iteration without needing a Kaggle submission, but the Kaggle private
-leaderboard numbers above are the real measure of generalization, since that
-test set was never touched during training or local validation.
-
-## Uploading to Hugging Face
-
-Since only the LoRA adapter needs to be shared (not the full base model),
-push just the adapter directory:
-
-```bash
-pip install huggingface_hub
-huggingface-cli login
-```
-
-Then, either via the CLI:
-
-```bash
-huggingface-cli upload <your-username>/<repo-name> ./checkpoints/first_mcq_lora
-```
-
-or from Python, using PEFT's built-in helper (loads the adapter, then pushes it):
+To use the adapter directly in your own code instead of the demo:
 
 ```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
-from transformers import AutoModelForCausalLM
 
-base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
-model = PeftModel.from_pretrained(base, "./checkpoints/first_mcq_lora")
-model.push_to_hub("<your-username>/<repo-name>")
+base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B-Instruct", torch_dtype="bfloat16")
+model = PeftModel.from_pretrained(base, "Adarshraj31415/smart-mcq-qwen2.5-lora")
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
 ```
 
-Include a `base_model: Qwen/Qwen2.5-7B-Instruct` field and the `library_name: peft`
-tag in the Hugging Face model card's YAML frontmatter so the Hub correctly
-links it as an adapter for the base model.
+## What I'd do differently next time
 
-## Notes on reproducibility
-
-- Seed is fixed (`seed: 42` in `config.yaml`) for the train/val split and
-  all RNG (Python, NumPy, PyTorch, CUDA).
-- `full_train` controls whether validation is real or a small dummy sample
-  — check this setting before trusting any printed metric.
+- Persist validation row indices to disk instead of re-deriving them by
+  seed and fraction in a second script. The eval leakage bug above would
+  have been impossible if the split were saved once and loaded everywhere.
+- Enable gradient checkpointing from the start rather than discovering the
+  need for it via two separate OOM crashes.
+- Get a second, truly held-out labeled split before the Kaggle leaderboard
+  closes, specifically so local evaluation doesn't depend on re-sampling
+  the only labeled file that exists.
